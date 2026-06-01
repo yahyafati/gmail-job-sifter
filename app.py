@@ -1,8 +1,11 @@
 import json
 import logging
+import random
 import sqlite3
+import time
 import uuid
 from configparser import ConfigParser
+from datetime import datetime
 from functools import wraps
 from pathlib import Path
 from typing import (
@@ -16,7 +19,7 @@ from typing import (
     Union,
 )
 
-from openai import OpenAI
+from openai import OpenAI, BadRequestError
 from openai.types.chat import (
     ChatCompletionUserMessageParam,
     ChatCompletionSystemMessageParam,
@@ -32,6 +35,8 @@ logger = logging.getLogger(__name__)
 MODE = Literal["dev", "prod"]
 DEFAULT_MODE: MODE = "prod"
 mode: MODE = DEFAULT_MODE
+
+NONE_CONTENT_FLAG = "CONTENT_WAS_NONE"
 
 
 @runtime_checkable
@@ -52,6 +57,13 @@ class ClassifiedEmail(TypedDict):
     body: str
     sender: str
     classification: str
+
+
+class ExceptionEmails(TypedDict):
+    message_id: str
+    exception: str
+    message: str
+    body: object
 
 
 CLOSEABLE: List[Closeable] = []
@@ -318,7 +330,6 @@ def update_classification(cur: sqlite3.Cursor, message_id: str, classification: 
 
 
 def classify_email(config: ConfigParser, client: OpenAI, email: EmailObject) -> str:
-    NONE_CONTENT_FLAG = "CONTENT_WAS_NONE"
     model = config["llm"]["model"]
     logger.debug(
         "Classifying email message_id='%s' using model='%s'",
@@ -382,11 +393,22 @@ def save_to_json(config: ConfigParser, temp_data: List[ClassifiedEmail]):
         raise
 
 
+def sleep_stochastically(min_s: float = 0.25, max_s: float = 3.0):
+    duration = random.uniform(min_s, max_s)
+    logger.info(f"Sleeping for {duration:.2f} seconds")
+    time.sleep(duration)
+
+
 def main():
     logger.info("=== Email Classifier Starting ===")
 
     config = load_config()
     set_mode(config)
+
+    run_id = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    log_path = Path(config["default"].get("logs_path", "logs")) / run_id
+    log_path.mkdir(parents=True, exist_ok=True)
+    logger.info(f"Current run logs can be found at: {log_path}")
 
     con = create_connection(config)
     cur = con.cursor()
@@ -411,6 +433,7 @@ def main():
         return
 
     temp_data: List[ClassifiedEmail] = []
+    error_items: List[ExceptionEmails] = []
     classification_counts: dict[str, int] = {}
     none_content_count = 0
 
@@ -424,9 +447,23 @@ def main():
             email["message_id"],
         )
 
-        classification = classify_email(config, client, email)
+        try:
+            classification = classify_email(config, client, email)
+        except BadRequestError as err:
+            logger.error(
+                f"Could not classify message. Skipping. Error Message: {err.message}"
+            )
+            error_items.append(
+                ExceptionEmails(
+                    message_id=email["message_id"],
+                    exception="BadRequestError",
+                    message=err.message,
+                    body=err.body,
+                )
+            )
+            break
 
-        if classification == "CONTENT_WAS_NONE":
+        if classification == NONE_CONTENT_FLAG:
             none_content_count += 1
             logger.warning(
                 "Email %d/%d (message_id='%s') received a None classification from LLM",
@@ -452,12 +489,19 @@ def main():
                 human_index,
                 total_number_of_emails,
             )
+        sleep_stochastically()
 
     logger.info("Classification complete. Summary:")
     for label, count in sorted(classification_counts.items()):
         logger.info("  %-25s %d", label, count)
     if none_content_count:
         logger.warning("  Emails with None LLM response: %d", none_content_count)
+
+    logger.info(
+        f"Saving error classification details to {log_path/'error_classifications.json'}"
+    )
+    with open(log_path / "error_classifications.json", "w", encoding="utf-8") as f:
+        json.dump(error_items, f, indent=4, ensure_ascii=False)
 
     current_mode = globals().get("mode", "prod")
     logger.debug("Post-classification mode check: mode='%s'", current_mode)
