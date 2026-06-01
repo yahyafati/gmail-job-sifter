@@ -22,6 +22,13 @@ from openai.types.chat import (
     ChatCompletionSystemMessageParam,
 )
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger(__name__)
+
 MODE = Literal["dev", "prod"]
 DEFAULT_MODE: MODE = "prod"
 mode: MODE = DEFAULT_MODE
@@ -51,17 +58,34 @@ CLOSEABLE: List[Closeable] = []
 
 
 def load_config(config_path="config.ini") -> ConfigParser:
+    logger.debug("Loading configuration from '%s'", config_path)
     config = ConfigParser()
-    config.read(config_path)
+    files_read = config.read(config_path)
+    if not files_read:
+        logger.warning(
+            "Config file '%s' not found or empty; using defaults", config_path
+        )
+    else:
+        logger.info("Configuration loaded from: %s", files_read)
+        logger.debug(
+            "Config sections found: %s",
+            config.sections(),
+        )
     return config
 
 
 def set_mode(config: ConfigParser) -> MODE:
     global mode
+    logger.debug("Reading 'mode' from config [default] section")
     _mode = config["default"].get("mode", mode)
     mode = cast(MODE, _mode)
     if not _mode:
+        logger.warning(
+            "No 'mode' key found in config; falling back to DEFAULT_MODE='%s'",
+            DEFAULT_MODE,
+        )
         return DEFAULT_MODE
+    logger.info("Application mode set to '%s'", mode)
     return mode
 
 
@@ -69,9 +93,20 @@ def run_on_mode(mode_required):
     def decorator(func):
         @wraps(func)
         def wrapper(*args, **kwargs):
-            if globals().get("mode") != mode_required:
-                logging.info(f"Skipping {func.__name__} (requires {mode_required})")
+            current_mode = globals().get("mode")
+            if current_mode != mode_required:
+                logger.debug(
+                    "Skipping '%s': requires mode='%s', current mode='%s'",
+                    func.__name__,
+                    mode_required,
+                    current_mode,
+                )
                 return None
+            logger.debug(
+                "Running '%s' (mode='%s' matches requirement)",
+                func.__name__,
+                mode_required,
+            )
             return func(*args, **kwargs)
 
         return wrapper
@@ -118,8 +153,15 @@ Subject: {email['subject']}
 
 def create_connection(config: ConfigParser) -> sqlite3.Connection:
     global CLOSEABLE
-    con = sqlite3.connect(config["default"]["db_path"])
-    CLOSEABLE.append(con)
+    db_path = config["default"]["db_path"]
+    logger.info("Connecting to SQLite database at '%s'", db_path)
+    try:
+        con = sqlite3.connect(db_path)
+        CLOSEABLE.append(con)
+        logger.debug("Database connection established and registered for cleanup")
+    except sqlite3.Error as e:
+        logger.exception("Failed to connect to database at '%s': %s", db_path, e)
+        raise
     return con
 
 
@@ -127,6 +169,7 @@ def get_override_safe_path(
     path: Union[Path, str], max_iter=100, uuid_on_max_iter=True
 ) -> Path:
     path = Path(path)
+    logger.debug("Resolving collision-safe path for '%s'", path)
     suffix_count = 0
 
     original_stem = path.stem
@@ -136,41 +179,105 @@ def get_override_safe_path(
     while path.exists():
         suffix_count += 1
         path = parent / f"{original_stem}_{suffix_count}{original_suffix}"
+        logger.debug("Path already exists; trying '%s'", path)
 
         if suffix_count >= max_iter:
             break
 
     if path.exists():
         if uuid_on_max_iter:
-            path = parent / f"{original_stem}_{uuid.uuid4()}{original_suffix}"
+            new_path = parent / f"{original_stem}_{uuid.uuid4()}{original_suffix}"
+            logger.warning(
+                "Reached max_iter=%d collision attempts for '%s'; "
+                "falling back to UUID path '%s'",
+                max_iter,
+                original_stem,
+                new_path,
+            )
+            path = new_path
         else:
+            logger.error(
+                "Could not find a free path after %d attempts for '%s'",
+                max_iter,
+                original_stem,
+            )
             raise FileExistsError(
                 f"Could not find free path after {max_iter} attempts: {path}"
             )
 
+    logger.debug("Resolved safe output path: '%s'", path)
     return path
 
 
-def get_row_count(cur: sqlite3.Cursor) -> int:
-    res = cur.execute("SELECT count(*) from emails")
-    count = res.fetchone()
-    return count[0]
+def get_row_count(config: ConfigParser, cur: sqlite3.Cursor) -> int:
+    logger.debug("Querying total email row count")
+    skip_classified = config["default"]["skip_classified"].lower() in [
+        "true",
+        "on",
+        "1",
+    ]
+    logger.info(f"Querying total email row count (skip_classified = {skip_classified})")
+    query = "SELECT count(*) FROM emails"
+    if skip_classified:
+        query = "SELECT count(*) FROM emails WHERE category is NULL"
+    try:
+        res = cur.execute(query)
+        count = res.fetchone()
+        total = count[0]
+        logger.info("Total emails in database: %d", total)
+        return total
+    except sqlite3.Error as e:
+        logger.exception("Failed to query row count: %s", e)
+        raise
 
 
 def generate_dataset(
     config: ConfigParser, cur: sqlite3.Cursor, chunk_size=64
 ) -> Iterator[EmailObject]:
-    skip_classified = config["default"]["skip_classified"] == "True"
+    skip_classified = config["default"]["skip_classified"].lower() in [
+        "true",
+        "on",
+        "1",
+    ]
+    logger.info(
+        "Generating dataset (skip_classified=%s, chunk_size=%d)",
+        skip_classified,
+        chunk_size,
+    )
+
     query = "SELECT message_id,subject,body,sender FROM emails"
     if skip_classified:
         query = (
             "SELECT message_id,subject,body,sender FROM emails WHERE category is NULL"
         )
-    res = cur.execute(query)
+    logger.debug("Dataset query: %s", query)
+
+    try:
+        res = cur.execute(query)
+    except sqlite3.Error as e:
+        logger.exception("Failed to execute dataset query: %s", e)
+        raise
+
+    chunk_index = 0
+    yielded_total = 0
     while True:
         rows = res.fetchmany(chunk_size)
         if not rows:
+            logger.debug(
+                "No more rows to fetch after %d chunks (%d emails yielded total)",
+                chunk_index,
+                yielded_total,
+            )
             break
+
+        logger.debug(
+            "Fetched chunk #%d with %d rows (cumulative: %d)",
+            chunk_index,
+            len(rows),
+            yielded_total + len(rows),
+        )
+        chunk_index += 1
+
         for message_id, subject, body, sender in rows:
             email_obj = EmailObject(
                 message_id=message_id,
@@ -178,57 +285,160 @@ def generate_dataset(
                 body=body,
                 sender=sender,
             )
+            logger.debug(
+                "Yielding email message_id='%s' subject='%s' sender='%s'",
+                message_id,
+                subject,
+                sender,
+            )
+            yielded_total += 1
             yield email_obj
+
+    logger.info("Dataset generation complete. Total emails yielded: %d", yielded_total)
 
 
 def update_classification(cur: sqlite3.Cursor, message_id: str, classification: str):
-    cur.execute(
-        "UPDATE emails SET category = ? WHERE message_id = ?",
-        (classification, message_id),
+    logger.debug(
+        "Updating classification for message_id='%s' to '%s'",
+        message_id,
+        classification,
     )
-    cur.connection.commit()
+    try:
+        cur.execute(
+            "UPDATE emails SET category = ? WHERE message_id = ?",
+            (classification, message_id),
+        )
+        cur.connection.commit()
+        logger.debug("Classification committed for message_id='%s'", message_id)
+    except sqlite3.Error as e:
+        logger.exception(
+            "Failed to update classification for message_id='%s': %s", message_id, e
+        )
+        raise
 
 
 def classify_email(config: ConfigParser, client: OpenAI, email: EmailObject) -> str:
     NONE_CONTENT_FLAG = "CONTENT_WAS_NONE"
-    completion = client.chat.completions.create(
-        model=config["llm"]["model"],
-        messages=[
-            ChatCompletionSystemMessageParam(role="system", content=system_prompt()),
-            ChatCompletionUserMessageParam(role="user", content=user_prompt(email)),
-        ],
+    model = config["llm"]["model"]
+    logger.debug(
+        "Classifying email message_id='%s' using model='%s'",
+        email["message_id"],
+        model,
     )
+
+    try:
+        completion = client.chat.completions.create(
+            model=model,
+            messages=[
+                ChatCompletionSystemMessageParam(
+                    role="system", content=system_prompt()
+                ),
+                ChatCompletionUserMessageParam(role="user", content=user_prompt(email)),
+            ],
+        )
+    except Exception as e:
+        logger.exception(
+            "LLM API call failed for message_id='%s': %s", email["message_id"], e
+        )
+        raise
+
     response_content = completion.choices[0].message.content
+
     if response_content is None:
+        logger.warning(
+            "LLM returned None content for message_id='%s'; flagging as '%s'",
+            email["message_id"],
+            NONE_CONTENT_FLAG,
+        )
         return NONE_CONTENT_FLAG
-    return response_content
+
+    classification = response_content.strip()
+    logger.debug(
+        "Classified message_id='%s' as '%s'",
+        email["message_id"],
+        classification,
+    )
+    return classification
 
 
 def save_to_json(config: ConfigParser, temp_data: List[ClassifiedEmail]):
     parent_path = Path(config["dev"]["output_path"])
-    parent_path.mkdir(parents=True, exist_ok=True)
-    output_path = get_override_safe_path(parent_path / "sample.json")
+    logger.info(
+        "Saving %d classified emails to JSON under '%s'", len(temp_data), parent_path
+    )
 
-    with open(output_path, "w", encoding="utf-8") as f:
-        json.dump(temp_data, f, indent=4, ensure_ascii=False)
+    parent_path.mkdir(parents=True, exist_ok=True)
+    logger.debug("Output directory ensured: '%s'", parent_path)
+
+    output_path = get_override_safe_path(parent_path / "sample.json")
+    logger.info("Writing JSON output to '%s'", output_path)
+
+    try:
+        with open(output_path, "w", encoding="utf-8") as f:
+            json.dump(temp_data, f, indent=4, ensure_ascii=False)
+        logger.info("JSON file written successfully: '%s'", output_path)
+    except OSError as e:
+        logger.exception("Failed to write JSON output to '%s': %s", output_path, e)
+        raise
 
 
 def main():
+    logger.info("=== Email Classifier Starting ===")
+
     config = load_config()
     set_mode(config)
+
     con = create_connection(config)
     cur = con.cursor()
+    logger.debug("Database cursor created")
+
+    logger.info(
+        "Initialising OpenAI client (base_url='%s', model='%s')",
+        config["llm"].get("base_url", "<default>"),
+        config["llm"].get("model", "<unknown>"),
+    )
     client = OpenAI(
         api_key=config["llm"]["api_key"],
         base_url=config["llm"]["base_url"],
     )
-    total_number_of_emails = get_row_count(cur)
-    print(f"Total Number of Emails: {total_number_of_emails}")
+    logger.debug("OpenAI client initialised")
+
+    total_number_of_emails = get_row_count(config, cur)
+    logger.info(f"Total Number of Emails: {total_number_of_emails}")
+
+    if total_number_of_emails == 0:
+        logger.warning("No emails found to classify; exiting early")
+        return
 
     temp_data: List[ClassifiedEmail] = []
+    classification_counts: dict[str, int] = {}
+    none_content_count = 0
+
+    logger.info("Starting classification loop for %d emails", total_number_of_emails)
     for i, email in enumerate(generate_dataset(config, cur)):
-        print(f"Classifying {i+1}/{total_number_of_emails}")
+        human_index = i + 1
+        logger.debug(
+            "Processing email %d/%d (message_id='%s')",
+            human_index,
+            total_number_of_emails,
+            email["message_id"],
+        )
+
         classification = classify_email(config, client, email)
+
+        if classification == "CONTENT_WAS_NONE":
+            none_content_count += 1
+            logger.warning(
+                "Email %d/%d (message_id='%s') received a None classification from LLM",
+                human_index,
+                total_number_of_emails,
+                email["message_id"],
+            )
+
+        classification_counts[classification] = (
+            classification_counts.get(classification, 0) + 1
+        )
+
         update_classification(
             cur,
             message_id=email["message_id"],
@@ -236,13 +446,45 @@ def main():
         )
         temp_data.append(ClassifiedEmail(classification=classification, **email))
 
-    if globals().get("mode", "prod") == "dev":
+        if human_index % 100 == 0 or human_index == total_number_of_emails:
+            logger.info(
+                "Progress: %d/%d emails classified",
+                human_index,
+                total_number_of_emails,
+            )
+
+    logger.info("Classification complete. Summary:")
+    for label, count in sorted(classification_counts.items()):
+        logger.info("  %-25s %d", label, count)
+    if none_content_count:
+        logger.warning("  Emails with None LLM response: %d", none_content_count)
+
+    current_mode = globals().get("mode", "prod")
+    logger.debug("Post-classification mode check: mode='%s'", current_mode)
+    if current_mode == "dev":
+        logger.info("Dev mode active — saving results to JSON")
         save_to_json(config, temp_data)
+    else:
+        logger.info("Prod mode active — skipping JSON export")
+
+    logger.info("=== Email Classifier Finished ===")
 
 
 if __name__ == "__main__":
     try:
+        logger.debug("Entry point reached")
         main()
+    except KeyboardInterrupt:
+        logger.fatal("User interrupted; aborting.")
+    except Exception:
+        logger.exception("Unhandled exception in main(); aborting")
+        raise
     finally:
+        logger.debug("Running cleanup for %d closeable resource(s)", len(CLOSEABLE))
         for item in CLOSEABLE:
-            item.close()
+            try:
+                item.close()
+                logger.debug("Closed resource: %s", item)
+            except Exception as e:
+                logger.warning("Failed to close resource %s: %s", item, e)
+        logger.info("Cleanup complete")
