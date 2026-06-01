@@ -1,4 +1,20 @@
-[llm]
-api_key=sk-***
-base_url=https://api.moonshot.ai/v1
-model=kimi-k2.6
+[default]
+mode = development
+db_path = database.db
+logs_path = logs
+skip_classified = True
+
+[dev]
+output_path = dev/samples
+
+[llm.1]
+name = moonshot
+api_key = sk-***
+base_url = https://api.moonshot.ai/v1
+model = kimi-k2.6
+
+[llm.2]
+name = gemini
+api_key =
+base_url = https://generativelanguage.googleapis.com/v1beta/openai/
+model = gemini-3.5-flash

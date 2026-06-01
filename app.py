@@ -1,9 +1,12 @@
 import json
 import logging
 import random
+import re
 import sqlite3
+import sys
 import time
 import uuid
+from collections import OrderedDict
 from configparser import ConfigParser
 from datetime import datetime
 from functools import wraps
@@ -17,9 +20,11 @@ from typing import (
     Literal,
     cast,
     Union,
+    Tuple,
+    Optional,
 )
 
-from openai import OpenAI, BadRequestError
+from openai import OpenAI
 from openai.types.chat import (
     ChatCompletionUserMessageParam,
     ChatCompletionSystemMessageParam,
@@ -64,6 +69,13 @@ class ExceptionEmails(TypedDict):
     exception: str
     message: str
     body: object
+
+
+class LLMConfig(TypedDict):
+    name: str
+    api_key: str
+    base_url: str
+    model: str
 
 
 CLOSEABLE: List[Closeable] = []
@@ -124,6 +136,31 @@ def run_on_mode(mode_required):
         return wrapper
 
     return decorator
+
+
+def get_ranked_llms(config: ConfigParser) -> List[LLMConfig]:
+    llms: List[Tuple[int, LLMConfig]] = []
+
+    for section in config.sections():
+        match = re.match(r"llm\.(\d+)", section)
+        if match:
+            rank = int(match.group(1))
+            llms.append(
+                (
+                    rank,
+                    LLMConfig(
+                        name=config.get(section, "name", fallback=f"llm_{rank}"),
+                        api_key=config.get(section, "api_key"),
+                        base_url=config.get(section, "base_url"),
+                        model=config.get(section, "model"),
+                    ),
+                )
+            )
+
+    # sort by rank
+    llms.sort(key=lambda x: x[0])
+
+    return [llm for _, llm in llms]
 
 
 def system_prompt() -> str:
@@ -329,47 +366,56 @@ def update_classification(cur: sqlite3.Cursor, message_id: str, classification: 
         raise
 
 
-def classify_email(config: ConfigParser, client: OpenAI, email: EmailObject) -> str:
-    model = config["llm"]["model"]
-    logger.debug(
-        "Classifying email message_id='%s' using model='%s'",
-        email["message_id"],
-        model,
-    )
+def classify_email(
+    clients: OrderedDict[str, OpenAI],
+    llm_configs: List[LLMConfig],
+    email: EmailObject,
+) -> Optional[str]:
 
-    try:
-        completion = client.chat.completions.create(
-            model=model,
-            messages=[
-                ChatCompletionSystemMessageParam(
-                    role="system", content=system_prompt()
-                ),
-                ChatCompletionUserMessageParam(role="user", content=user_prompt(email)),
-            ],
-        )
-    except Exception as e:
-        logger.exception(
-            "LLM API call failed for message_id='%s': %s", email["message_id"], e
-        )
-        raise
+    for i, (provider_name, client) in enumerate(clients.items()):
+        model = llm_configs[i]["model"]
+        try:
+            logger.debug(
+                "Classifying email message_id='%s' using model='%s', provider='%s'",
+                email["message_id"],
+                model,
+                provider_name,
+            )
+            completion = client.chat.completions.create(
+                model=model,
+                messages=[
+                    ChatCompletionSystemMessageParam(
+                        role="system", content=system_prompt()
+                    ),
+                    ChatCompletionUserMessageParam(
+                        role="user", content=user_prompt(email)
+                    ),
+                ],
+            )
 
-    response_content = completion.choices[0].message.content
+            response_content = completion.choices[0].message.content
 
-    if response_content is None:
-        logger.warning(
-            "LLM returned None content for message_id='%s'; flagging as '%s'",
-            email["message_id"],
-            NONE_CONTENT_FLAG,
-        )
-        return NONE_CONTENT_FLAG
+            if response_content is None:
+                logger.warning(
+                    "LLM returned None content for message_id='%s'; flagging as '%s'",
+                    email["message_id"],
+                    NONE_CONTENT_FLAG,
+                )
+                return NONE_CONTENT_FLAG
 
-    classification = response_content.strip()
-    logger.debug(
-        "Classified message_id='%s' as '%s'",
-        email["message_id"],
-        classification,
-    )
-    return classification
+            classification = response_content.strip()
+            logger.debug(
+                "Classified message_id='%s' as '%s'",
+                email["message_id"],
+                classification,
+            )
+            return classification
+        except Exception as err:
+            logger.exception(
+                "LLM API call failed for message_id='%s': %s", email["message_id"], err
+            )
+
+    return None
 
 
 def save_to_json(config: ConfigParser, temp_data: List[ClassifiedEmail]):
@@ -399,6 +445,25 @@ def sleep_stochastically(min_s: float = 0.25, max_s: float = 3.0):
     time.sleep(duration)
 
 
+def create_clients(llms: List[LLMConfig]) -> OrderedDict[str, OpenAI]:
+    logger.info("Initialising OpenAI clients")
+    clients: OrderedDict[str, OpenAI] = OrderedDict()
+    for llm_config in llms:
+        logger.info(
+            "Initialising client (name = '%s', base_url = '%s', model='%s', api_key = '%s')",
+            llm_config["name"],
+            llm_config["base_url"],
+            llm_config["model"],
+            "YOU WISH",
+        )
+        client = OpenAI(
+            api_key=llm_config["api_key"],
+            base_url=llm_config["base_url"],
+        )
+        clients[llm_config["name"]] = client
+    return clients
+
+
 def main():
     logger.info("=== Email Classifier Starting ===")
 
@@ -414,16 +479,12 @@ def main():
     cur = con.cursor()
     logger.debug("Database cursor created")
 
-    logger.info(
-        "Initialising OpenAI client (base_url='%s', model='%s')",
-        config["llm"].get("base_url", "<default>"),
-        config["llm"].get("model", "<unknown>"),
-    )
-    client = OpenAI(
-        api_key=config["llm"]["api_key"],
-        base_url=config["llm"]["base_url"],
-    )
-    logger.debug("OpenAI client initialised")
+    ranked_llms = get_ranked_llms(config)
+    if len(ranked_llms) == 0:
+        logger.fatal("At least one LLM definition needed.")
+        sys.exit(32)
+    ranked_clients = create_clients(ranked_llms)
+    logger.debug(f"{len(ranked_clients)} OpenAI clients initialized.")
 
     total_number_of_emails = get_row_count(config, cur)
     logger.info(f"Total Number of Emails: {total_number_of_emails}")
@@ -433,7 +494,6 @@ def main():
         return
 
     temp_data: List[ClassifiedEmail] = []
-    error_items: List[ExceptionEmails] = []
     classification_counts: dict[str, int] = {}
     none_content_count = 0
 
@@ -447,21 +507,7 @@ def main():
             email["message_id"],
         )
 
-        try:
-            classification = classify_email(config, client, email)
-        except BadRequestError as err:
-            logger.error(
-                f"Could not classify message. Skipping. Error Message: {err.message}"
-            )
-            error_items.append(
-                ExceptionEmails(
-                    message_id=email["message_id"],
-                    exception="BadRequestError",
-                    message=err.message,
-                    body=err.body,
-                )
-            )
-            break
+        classification = classify_email(ranked_clients, ranked_llms, email)
 
         if classification == NONE_CONTENT_FLAG:
             none_content_count += 1
@@ -472,16 +518,21 @@ def main():
                 email["message_id"],
             )
 
-        classification_counts[classification] = (
-            classification_counts.get(classification, 0) + 1
-        )
+        if classification is not None:
+            classification_counts[classification] = (
+                classification_counts.get(classification, 0) + 1
+            )
 
-        update_classification(
-            cur,
-            message_id=email["message_id"],
-            classification=classification,
-        )
-        temp_data.append(ClassifiedEmail(classification=classification, **email))
+            update_classification(
+                cur,
+                message_id=email["message_id"],
+                classification=classification,
+            )
+            temp_data.append(ClassifiedEmail(classification=classification, **email))
+        else:
+            logger.warning(
+                "Could not classify using any of the LLMs provided. Skipping!"
+            )
 
         if human_index % 100 == 0 or human_index == total_number_of_emails:
             logger.info(
@@ -496,12 +547,6 @@ def main():
         logger.info("  %-25s %d", label, count)
     if none_content_count:
         logger.warning("  Emails with None LLM response: %d", none_content_count)
-
-    logger.info(
-        f"Saving error classification details to {log_path/'error_classifications.json'}"
-    )
-    with open(log_path / "error_classifications.json", "w", encoding="utf-8") as f:
-        json.dump(error_items, f, indent=4, ensure_ascii=False)
 
     current_mode = globals().get("mode", "prod")
     logger.debug("Post-classification mode check: mode='%s'", current_mode)
