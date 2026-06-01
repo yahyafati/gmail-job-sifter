@@ -30,12 +30,17 @@ from openai.types.chat import (
     ChatCompletionSystemMessageParam,
 )
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+formatter = logging.Formatter(
+    "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
+
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+console_handler = logging.StreamHandler()
+console_handler.setFormatter(formatter)
+
+logger.addHandler(console_handler)
 
 MODE = Literal["dev", "prod"]
 DEFAULT_MODE: MODE = "prod"
@@ -474,6 +479,11 @@ def main():
     log_path = Path(config["default"].get("logs_path", "logs")) / run_id
     log_path.mkdir(parents=True, exist_ok=True)
     logger.info(f"Current run logs can be found at: {log_path}")
+
+    file_handler = logging.FileHandler(log_path / "app.log")
+    file_handler.setFormatter(formatter)
+
+    logger.addHandler(file_handler)
 
     con = create_connection(config)
     cur = con.cursor()
