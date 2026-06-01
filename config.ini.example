@@ -1,0 +1,4 @@
+[llm]
+api_key=sk-***
+base_url=https://api.moonshot.ai/v1
+model=kimi-k2.6
