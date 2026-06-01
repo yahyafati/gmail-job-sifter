@@ -321,14 +321,14 @@ def generate_dataset(
     while True:
         rows = res.fetchmany(chunk_size)
         if not rows:
-            logger.debug(
+            logger.info(
                 "No more rows to fetch after %d chunks (%d emails yielded total)",
                 chunk_index,
                 yielded_total,
             )
             break
 
-        logger.debug(
+        logger.info(
             "Fetched chunk #%d with %d rows (cumulative: %d)",
             chunk_index,
             len(rows),
@@ -496,7 +496,8 @@ def main():
     logger.addHandler(file_handler)
 
     con = create_connection(config)
-    cur = con.cursor()
+    read_cursor = con.cursor()
+    write_cursor = con.cursor()
     logger.debug("Database cursor created")
 
     ranked_llms = get_ranked_llms(config)
@@ -506,7 +507,7 @@ def main():
     ranked_clients = create_clients(ranked_llms)
     logger.debug(f"{len(ranked_clients)} OpenAI clients initialized.")
 
-    total_number_of_emails = get_row_count(config, cur)
+    total_number_of_emails = get_row_count(config, read_cursor)
     logger.info(f"Total Number of Emails: {total_number_of_emails}")
 
     if total_number_of_emails == 0:
@@ -518,7 +519,7 @@ def main():
     none_content_count = 0
 
     logger.info("Starting classification loop for %d emails", total_number_of_emails)
-    for i, email in enumerate(generate_dataset(config, cur)):
+    for i, email in enumerate(generate_dataset(config, read_cursor)):
         human_index = i + 1
         logger.debug(
             "Processing email %d/%d (message_id='%s')",
@@ -546,7 +547,7 @@ def main():
             )
 
             update_classification(
-                cur,
+                write_cursor,
                 message_id=email["message_id"],
                 classification=classification,
             )
