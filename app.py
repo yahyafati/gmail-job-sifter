@@ -30,6 +30,8 @@ from openai.types.chat import (
     ChatCompletionSystemMessageParam,
 )
 
+from text_cleaner import TextCleaner
+
 formatter = logging.Formatter(
     "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
@@ -286,7 +288,10 @@ def get_row_count(config: ConfigParser, cur: sqlite3.Cursor) -> int:
 
 
 def generate_dataset(
-    config: ConfigParser, cur: sqlite3.Cursor, chunk_size=64
+    config: ConfigParser,
+    cur: sqlite3.Cursor,
+    text_cleaner: TextCleaner,
+    chunk_size=64,
 ) -> Iterator[EmailObject]:
     skip_classified = config["default"]["skip_classified"].lower() in [
         "true",
@@ -336,7 +341,7 @@ def generate_dataset(
             email_obj = EmailObject(
                 message_id=message_id,
                 subject=subject,
-                body=body,
+                body=text_cleaner.clean_text(body),
                 sender=sender,
             )
             logger.debug(
@@ -475,6 +480,8 @@ def main():
     config = load_config()
     set_mode(config)
 
+    text_cleaner = TextCleaner(logger)
+
     run_id = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     log_path = Path(config["default"].get("logs_path", "logs")) / run_id
     log_path.mkdir(parents=True, exist_ok=True)
@@ -508,7 +515,7 @@ def main():
     none_content_count = 0
 
     logger.info("Starting classification loop for %d emails", total_number_of_emails)
-    for i, email in enumerate(generate_dataset(config, cur)):
+    for i, email in enumerate(generate_dataset(config, cur, text_cleaner)):
         human_index = i + 1
         logger.debug(
             "Processing email %d/%d (message_id='%s')",
