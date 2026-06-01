@@ -2,6 +2,7 @@ import logging
 from logging import Logger
 
 import regex as re
+from bs4 import BeautifulSoup
 
 
 class TextCleaner:
@@ -16,6 +17,14 @@ class TextCleaner:
     SEPARATOR_LINE = re.compile(r"(?m)^[\s\p{P}\p{S}]{5,}\s*$")
 
     ALLOWED_CHARS = re.compile(r"[^\p{Latin}\p{N}\p{P}\p{Z}\n]")
+
+    UUID_PATTERN = re.compile(
+        r"\b[0-9a-fA-F]{8}-"
+        r"[0-9a-fA-F]{4}-"
+        r"[0-9a-fA-F]{4}-"
+        r"[0-9a-fA-F]{4}-"
+        r"[0-9a-fA-F]{12}\b"
+    )
 
     def __init__(self, logger: Logger | None = None):
         self.logger = logger or self._build_default_logger()
@@ -85,12 +94,25 @@ class TextCleaner:
 
         return text.strip()
 
+    @staticmethod
+    def _strip_html(text: str) -> str:
+        soup = BeautifulSoup(text, "html.parser")
+        return soup.get_text(separator=" ", strip=True)
+
+    @staticmethod
+    def replace_uuid(text: str) -> str:
+        return TextCleaner.UUID_PATTERN.sub("[UUID]", text)
+
     # ---------------- public API ----------------
 
     def clean_text(self, text: str, max_iters: int = 10) -> str:
-        self.logger.info(
-            "Starting cleaning | initial_len=%d | max_iters=%d", len(text), max_iters
+        start_length = len(text)
+        self.logger.debug(
+            "Starting cleaning | initial_len=%d | max_iters=%d", start_length, max_iters
         )
+
+        text = self._strip_html(text)
+        text = self.replace_uuid(text)
 
         prev = None
         curr = text
@@ -111,98 +133,32 @@ class TextCleaner:
                 break
 
             prev = curr
-
-        self.logger.info("Finished cleaning | final_len=%d", len(curr))
+        end_length = len(curr)
+        self.logger.debug("Finished cleaning | final_len=%d", end_length)
+        self.logger.info(f"Cleaned text from {start_length} to {end_length}")
         return curr
 
 
 if __name__ == "__main__":
-    SAMPLE = """
-Top job picks for you:     https://www.linkedin.com/comm/jobs/collections/recommended?origin=JYMBII_EMAIL&lgCta=eml-jymbii-bottom-see-all-jobs&lgTemp=jobs_jymbii_digest&lipi=urn%3Ali%3Apage%3Aemail_jobs_jymbii_digest%3BSdvcyj1EQiG4bGAF5nzBZQ%3D%3D&midToken=AQEAZB3EUSKipA&midSig=0WsEYoR_5aisc1&trk=eml-jobs_jymbii_digest-null-0-null&trkEmail=eml-jobs_jymbii_digest-null-0-null-null-e32yz0~mn7ha5yo~u7-null-null&eid=e32yz0-mn7ha5yo-u7&otpToken=MWEwMDFmZTcxMjJkYzBjMGJjMjQwNGVkNDExYWUyYjY4NmM3ZDE0NDliYWQ4YjYxNzZjZTAxNmU0ZTUyNWNmM2YzZGRkZmEzNDhjOGUwY2I2NDg1Yzk3ZDg4MjI0Njg3OWM3N2Q4ZGQyMzBiMjQ5NWRlMjE0NywxLDE%3D
-  
-            
-Full Stack Developer - Java & React (f/m/d)
-ecosio
-Munich
+    import argparse, sys
 
-This company is actively hiring
-View job: https://www.linkedin.com/comm/jobs/view/4385312888/?trackingId=ZHUmFP1%2FTVKZRtZRxOkDrQ%3D%3D&refId=H4z3acSeTJa65jD4EvyFfg%3D%3D&lipi=urn%3Ali%3Apage%3Aemail_jobs_jymbii_digest%3BSdvcyj1EQiG4bGAF5nzBZQ%3D%3D&midToken=AQEAZB3EUSKipA&midSig=0WsEYoR_5aisc1&trk=eml-jobs_jymbii_digest-jymbii-0-view_job&trkEmail=eml-jobs_jymbii_digest-jymbii-0-view_job-null-e32yz0~mn7ha5yo~u7-null-null&eid=e32yz0-mn7ha5yo-u7&otpToken=MWEwMDFmZTcxMjJkYzBjMGJjMjQwNGVkNDExYWUyYjY4NmM3ZDE0NDliYWQ4YjYxNzZjZTAxNmU0ZTUyNWNmM2YzZGRkZmEzNDhjOGUwY2I2NDg1Yzk3ZDg4MjI0Njg3OWM3N2Q4ZGQyMzBiMjQ5NWRlMjE0NywxLDE%3D
+    parser = argparse.ArgumentParser(description="Clean text using TextCleaner")
 
----------------------------------------------------------
-  
-            
-Full Stack / Front End Engineer (Freelance)
-MVP Match
-Berlin Metropolitan Area
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("--text", "-t", type=str, help="Raw input text")
+    group.add_argument("--file", "-f", type=str, help="Path to input text file")
 
-This company is actively hiring
-Apply with resume & profile
-View job: https://www.linkedin.com/comm/jobs/view/4384248594/?trackingId=C60YNZp5SSOoifyp7yWubQ%3D%3D&refId=z83D%2F%2BVwTuuve4Hf8gUyNQ%3D%3D&lipi=urn%3Ali%3Apage%3Aemail_jobs_jymbii_digest%3BSdvcyj1EQiG4bGAF5nzBZQ%3D%3D&midToken=AQEAZB3EUSKipA&midSig=0WsEYoR_5aisc1&trk=eml-jobs_jymbii_digest-jymbii-0-view_job&trkEmail=eml-jobs_jymbii_digest-jymbii-0-view_job-null-e32yz0~mn7ha5yo~u7-null-null&eid=e32yz0-mn7ha5yo-u7&otpToken=MWEwMDFmZTcxMjJkYzBjMGJjMjQwNGVkNDExYWUyYjY4NmM3ZDE0NDliYWQ4YjYxNzZjZTAxNmU0ZTUyNWNmM2YzZGRkZmEzNDhjOGUwY2I2NDg1Yzk3ZDg4MjI0Njg3OWM3N2Q4ZGQyMzBiMjQ5NWRlMjE0NywxLDE%3D
+    args = parser.parse_args()
 
----------------------------------------------------------
-  
-            
-Software Engineer, Front-End
-Superhuman
-Berlin
-
-High experience match
-View job: https://www.linkedin.com/comm/jobs/view/4384635364/?trackingId=um4mXi%2FGQZKtdboLGvfpxA%3D%3D&refId=zyAYCyUXSyiJXdVBE%2B%2BDYA%3D%3D&lipi=urn%3Ali%3Apage%3Aemail_jobs_jymbii_digest%3BSdvcyj1EQiG4bGAF5nzBZQ%3D%3D&midToken=AQEAZB3EUSKipA&midSig=0WsEYoR_5aisc1&trk=eml-jobs_jymbii_digest-jymbii-0-view_job&trkEmail=eml-jobs_jymbii_digest-jymbii-0-view_job-null-e32yz0~mn7ha5yo~u7-null-null&eid=e32yz0-mn7ha5yo-u7&otpToken=MWEwMDFmZTcxMjJkYzBjMGJjMjQwNGVkNDExYWUyYjY4NmM3ZDE0NDliYWQ4YjYxNzZjZTAxNmU0ZTUyNWNmM2YzZGRkZmEzNDhjOGUwY2I2NDg1Yzk3ZDg4MjI0Njg3OWM3N2Q4ZGQyMzBiMjQ5NWRlMjE0NywxLDE%3D
-
----------------------------------------------------------
-  
-            
-Frontend Engineer (all genders)
-Avelios Medical
-Munich
-
-2 school alumni
-View job: https://www.linkedin.com/comm/jobs/view/4361502751/?trackingId=MV659Nk5TxuiVuAB6%2BBSWQ%3D%3D&refId=NxtxtizOShOS7tiS4YxO%2Bw%3D%3D&lipi=urn%3Ali%3Apage%3Aemail_jobs_jymbii_digest%3BSdvcyj1EQiG4bGAF5nzBZQ%3D%3D&midToken=AQEAZB3EUSKipA&midSig=0WsEYoR_5aisc1&trk=eml-jobs_jymbii_digest-jymbii-0-view_job&trkEmail=eml-jobs_jymbii_digest-jymbii-0-view_job-null-e32yz0~mn7ha5yo~u7-null-null&eid=e32yz0-mn7ha5yo-u7&otpToken=MWEwMDFmZTcxMjJkYzBjMGJjMjQwNGVkNDExYWUyYjY4NmM3ZDE0NDliYWQ4YjYxNzZjZTAxNmU0ZTUyNWNmM2YzZGRkZmEzNDhjOGUwY2I2NDg1Yzk3ZDg4MjI0Njg3OWM3N2Q4ZGQyMzBiMjQ5NWRlMjE0NywxLDE%3D
-
----------------------------------------------------------
-  
-            
-Web-Frontend-Developer:innen (w/m/d)
-Instaffo
-90429
-
-This company is actively hiring
-View job: https://www.linkedin.com/comm/jobs/view/4344413547/?trackingId=xZL4s0cZTI%2Bi9x2vZ3AYMA%3D%3D&refId=AvPctVvRQgyUAQShZ6flWw%3D%3D&lipi=urn%3Ali%3Apage%3Aemail_jobs_jymbii_digest%3BSdvcyj1EQiG4bGAF5nzBZQ%3D%3D&midToken=AQEAZB3EUSKipA&midSig=0WsEYoR_5aisc1&trk=eml-jobs_jymbii_digest-jymbii-0-view_job&trkEmail=eml-jobs_jymbii_digest-jymbii-0-view_job-null-e32yz0~mn7ha5yo~u7-null-null&eid=e32yz0-mn7ha5yo-u7&otpToken=MWEwMDFmZTcxMjJkYzBjMGJjMjQwNGVkNDExYWUyYjY4NmM3ZDE0NDliYWQ4YjYxNzZjZTAxNmU0ZTUyNWNmM2YzZGRkZmEzNDhjOGUwY2I2NDg1Yzk3ZDg4MjI0Njg3OWM3N2Q4ZGQyMzBiMjQ5NWRlMjE0NywxLDE%3D
-
----------------------------------------------------------
-  
-            
-Software Engineer (Python/React)
-AMBOSS
-Berlin
-
-This company is actively hiring
-View job: https://www.linkedin.com/comm/jobs/view/4348073626/?trackingId=v2yJ2RBhTrKLkyXWhfykWw%3D%3D&refId=jETddmoyRnOLQdewO8R1uw%3D%3D&lipi=urn%3Ali%3Apage%3Aemail_jobs_jymbii_digest%3BSdvcyj1EQiG4bGAF5nzBZQ%3D%3D&midToken=AQEAZB3EUSKipA&midSig=0WsEYoR_5aisc1&trk=eml-jobs_jymbii_digest-jymbii-0-view_job&trkEmail=eml-jobs_jymbii_digest-jymbii-0-view_job-null-e32yz0~mn7ha5yo~u7-null-null&eid=e32yz0-mn7ha5yo-u7&otpToken=MWEwMDFmZTcxMjJkYzBjMGJjMjQwNGVkNDExYWUyYjY4NmM3ZDE0NDliYWQ4YjYxNzZjZTAxNmU0ZTUyNWNmM2YzZGRkZmEzNDhjOGUwY2I2NDg1Yzk3ZDg4MjI0Njg3OWM3N2Q4ZGQyMzBiMjQ5NWRlMjE0NywxLDE%3D
-
----------------------------------------------------------
-  
-See all jobs https://www.linkedin.com/comm/jobs/collections/recommended?origin=JYMBII_EMAIL&lgCta=eml-jymbii-bottom-see-all-jobs&lgTemp=jobs_jymbii_digest&lipi=urn%3Ali%3Apage%3Aemail_jobs_jymbii_digest%3BSdvcyj1EQiG4bGAF5nzBZQ%3D%3D&midToken=AQEAZB3EUSKipA&midSig=0WsEYoR_5aisc1&trk=eml-jobs_jymbii_digest-null-0-null&trkEmail=eml-jobs_jymbii_digest-null-0-null-null-e32yz0~mn7ha5yo~u7-null-null&eid=e32yz0-mn7ha5yo-u7&otpToken=MWEwMDFmZTcxMjJkYzBjMGJjMjQwNGVkNDExYWUyYjY4NmM3ZDE0NDliYWQ4YjYxNzZjZTAxNmU0ZTUyNWNmM2YzZGRkZmEzNDhjOGUwY2I2NDg1Yzk3ZDg4MjI0Njg3OWM3N2Q4ZGQyMzBiMjQ5NWRlMjE0NywxLDE%3D
-
-Land your next role with Premium
-See jobs where you’re more likely to hear back.
-http://www.linkedin.com/comm/premium/products/?upsellOrderOrigin=Tracking%3Av1%3Aemail_jymbii_upsell%3AEmail+Stork%3AMarketing&utype=job&referenceId=ajJB2s%2B%2BQSWdqarYJaMO1w%3D%3D&isSS=false&lipi=urn%3Ali%3Apage%3Aemail_jobs_jymbii_digest%3BSdvcyj1EQiG4bGAF5nzBZQ%3D%3D&midToken=AQEAZB3EUSKipA&midSig=0WsEYoR_5aisc1&trk=eml-jobs_jymbii_digest-jymbii-0-premium~upsell~v2~text&trkEmail=eml-jobs_jymbii_digest-jymbii-0-premium~upsell~v2~text-null-e32yz0~mn7ha5yo~u7-null-null&eid=e32yz0-mn7ha5yo-u7&otpToken=MWEwMDFmZTcxMjJkYzBjMGJjMjQwNGVkNDExYWUyYjY4NmM3ZDE0NDliYWQ4YjYxNzZjZTAxNmU0ZTUyNWNmM2YzZGRkZmEzNDhjOGUwY2I2NDg1Yzk3ZDg4MjI0Njg3OWM3N2Q4ZGQyMzBiMjQ5NWRlMjE0NywxLDE%3D
-  
-
-
-----------------------------------------
-
-This email was intended for Yahya Haji (Full-stack Developer)
-Learn why we included this: https://www.linkedin.com/help/linkedin/answer/4788?lang=en&lipi=urn%3Ali%3Apage%3Aemail_jobs_jymbii_digest%3BSdvcyj1EQiG4bGAF5nzBZQ%3D%3D&midToken=AQEAZB3EUSKipA&midSig=0WsEYoR_5aisc1&trk=eml-jobs_jymbii_digest-SecurityHelp-0-textfooterglimmer&trkEmail=eml-jobs_jymbii_digest-SecurityHelp-0-textfooterglimmer-null-e32yz0~mn7ha5yo~u7-null-null&eid=e32yz0-mn7ha5yo-u7&otpToken=MWEwMDFmZTcxMjJkYzBjMGJjMjQwNGVkNDExYWUyYjY4NmM3ZDE0NDliYWQ4YjYxNzZjZTAxNmU0ZTUyNWNmM2YzZGRkZmEzNDhjOGUwY2I2NDg1Yzk3ZDg4MjI0Njg3OWM3N2Q4ZGQyMzBiMjQ5NWRlMjE0NywxLDE%3D
-You are receiving Jobs You Might Be Interested In emails.
-
-         https://www.linkedin.com/comm/jobs/alerts?lipi=urn%3Ali%3Apage%3Aemail_jobs_jymbii_digest%3BSdvcyj1EQiG4bGAF5nzBZQ%3D%3D&midToken=AQEAZB3EUSKipA&midSig=0WsEYoR_5aisc1&trk=eml-jobs_jymbii_digest-null-0-null&trkEmail=eml-jobs_jymbii_digest-null-0-null-null-e32yz0~mn7ha5yo~u7-null-null&eid=e32yz0-mn7ha5yo-u7&otpToken=MWEwMDFmZTcxMjJkYzBjMGJjMjQwNGVkNDExYWUyYjY4NmM3ZDE0NDliYWQ4YjYxNzZjZTAxNmU0ZTUyNWNmM2YzZGRkZmEzNDhjOGUwY2I2NDg1Yzk3ZDg4MjI0Njg3OWM3N2Q4ZGQyMzBiMjQ5NWRlMjE0NywxLDE%3D 
-Unsubscribe: https://www.linkedin.com/comm/psettings/email-unsubscribe?lipi=urn%3Ali%3Apage%3Aemail_jobs_jymbii_digest%3BSdvcyj1EQiG4bGAF5nzBZQ%3D%3D&midToken=AQEAZB3EUSKipA&midSig=0WsEYoR_5aisc1&trk=eml-jobs_jymbii_digest-unsubscribe-0-textfooterglimmer&trkEmail=eml-jobs_jymbii_digest-unsubscribe-0-textfooterglimmer-null-e32yz0~mn7ha5yo~u7-null-null&eid=e32yz0-mn7ha5yo-u7&loid=AQE5dP8WwDBuJgAAAZ0qOalMlO86GZkE-W802RTBO9Gln68cGP8ZEGULPbUev0IkAYAH39QJNLlkaRGIRJQ4YA2-Y9PgCxdhNfI42g
-Help: https://www.linkedin.com/help/linkedin/answer/67?lang=en&lipi=urn%3Ali%3Apage%3Aemail_jobs_jymbii_digest%3BSdvcyj1EQiG4bGAF5nzBZQ%3D%3D&midToken=AQEAZB3EUSKipA&midSig=0WsEYoR_5aisc1&trk=eml-jobs_jymbii_digest-help-0-textfooterglimmer&trkEmail=eml-jobs_jymbii_digest-help-0-textfooterglimmer-null-e32yz0~mn7ha5yo~u7-null-null&eid=e32yz0-mn7ha5yo-u7&otpToken=MWEwMDFmZTcxMjJkYzBjMGJjMjQwNGVkNDExYWUyYjY4NmM3ZDE0NDliYWQ4YjYxNzZjZTAxNmU0ZTUyNWNmM2YzZGRkZmEzNDhjOGUwY2I2NDg1Yzk3ZDg4MjI0Njg3OWM3N2Q4ZGQyMzBiMjQ5NWRlMjE0NywxLDE%3D
-
-© 2026 LinkedIn Corporation, 1zwnj000 West Maude Avenue, Sunnyvale, CA 94085.
-LinkedIn and the LinkedIn logo are registered trademarks of LinkedIn.
-    """
-
+    sample = None
+    if args.text is not None:
+        sample = args.text
+    else:
+        with open(args.file, "r", encoding="utf-8") as f:
+            sample = f.read()
+    if not sample:
+        sys.exit(-1)
     cleaner = TextCleaner()
-    cleaned = cleaner.clean_text(SAMPLE)
+    cleaned = cleaner.clean_text(sample)
+
     print(cleaned)

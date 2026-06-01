@@ -111,3 +111,4 @@ database.db*
 config.ini
 samples/
 logs/
+sample.*.txt

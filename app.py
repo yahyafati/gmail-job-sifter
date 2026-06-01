@@ -290,7 +290,6 @@ def get_row_count(config: ConfigParser, cur: sqlite3.Cursor) -> int:
 def generate_dataset(
     config: ConfigParser,
     cur: sqlite3.Cursor,
-    text_cleaner: TextCleaner,
     chunk_size=64,
 ) -> Iterator[EmailObject]:
     skip_classified = config["default"]["skip_classified"].lower() in [
@@ -341,7 +340,7 @@ def generate_dataset(
             email_obj = EmailObject(
                 message_id=message_id,
                 subject=subject,
-                body=text_cleaner.clean_text(body),
+                body=body,
                 sender=sender,
             )
             logger.debug(
@@ -378,6 +377,7 @@ def update_classification(cur: sqlite3.Cursor, message_id: str, classification: 
 
 def classify_email(
     clients: OrderedDict[str, OpenAI],
+    text_cleaner: TextCleaner,
     llm_configs: List[LLMConfig],
     email: EmailObject,
 ) -> Optional[str]:
@@ -385,12 +385,14 @@ def classify_email(
     for i, (provider_name, client) in enumerate(clients.items()):
         model = llm_configs[i]["model"]
         try:
-            logger.debug(
+            logger.info(
                 "Classifying email message_id='%s' using model='%s', provider='%s'",
                 email["message_id"],
                 model,
                 provider_name,
             )
+            clean_email = EmailObject(**email)
+            clean_email["body"] = text_cleaner.clean_text(email["body"])
             completion = client.chat.completions.create(
                 model=model,
                 messages=[
@@ -398,7 +400,8 @@ def classify_email(
                         role="system", content=system_prompt()
                     ),
                     ChatCompletionUserMessageParam(
-                        role="user", content=user_prompt(email)
+                        role="user",
+                        content=user_prompt(clean_email),
                     ),
                 ],
             )
@@ -515,7 +518,7 @@ def main():
     none_content_count = 0
 
     logger.info("Starting classification loop for %d emails", total_number_of_emails)
-    for i, email in enumerate(generate_dataset(config, cur, text_cleaner)):
+    for i, email in enumerate(generate_dataset(config, cur)):
         human_index = i + 1
         logger.debug(
             "Processing email %d/%d (message_id='%s')",
@@ -524,7 +527,9 @@ def main():
             email["message_id"],
         )
 
-        classification = classify_email(ranked_clients, ranked_llms, email)
+        classification = classify_email(
+            ranked_clients, text_cleaner, ranked_llms, email
+        )
 
         if classification == NONE_CONTENT_FLAG:
             none_content_count += 1
