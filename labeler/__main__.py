@@ -252,24 +252,31 @@ def list_message_refs(
             break
 
 
-def _generate_data_from_gmail_(config: ConfigParser, service: Resource, chunk_size=64):
+def _generate_data_from_gmail_(
+    config: ConfigParser,
+    service: Resource,
+    chunk_size=64,
+    update_chunk_size: Optional[int] = None,
+):
     logger.info("Starting Gmail data generation pipeline.")
 
     ranked_llms = get_ranked_llms(config)
-    logger.debug(f"Ranked LLMs retrieved: {ranked_llms}")
-    if len(ranked_llms) == 0:
-        logger.fatal("At least one LLM definition needed.")
+    logger.debug("Ranked LLM configs loaded: %d entries", len(ranked_llms))
+
+    if not ranked_llms:
+        logger.fatal("No LLM definitions found. At least one is required.")
         sys.exit(32)
-    logger.info(f"{len(ranked_llms)} ranked LLM(s) loaded.")
+
+    logger.info("LLM configuration initialized (%d models).", len(ranked_llms))
 
     ranked_clients = create_clients(ranked_llms, logger)
-    logger.debug(f"{len(ranked_clients)} OpenAI clients initialized.")
+    logger.debug("LLM clients initialized (%d clients).", len(ranked_clients))
 
     text_cleaner = TextCleaner(logger)
     logger.debug("TextCleaner initialized.")
 
     oldest_date = normalize_email_date(config.get("labeler", "after_date"))
-    logger.info(f"Oldest allowed email date (after_date): {oldest_date}")
+    logger.info("Email cutoff date (after_date) resolved to: %s", oldest_date)
 
     continue_fetching = True
     batch_index = 0
@@ -277,18 +284,23 @@ def _generate_data_from_gmail_(config: ConfigParser, service: Resource, chunk_si
     for batch_refs in list_message_refs(service=service, chunk_size=chunk_size):
         batch_index += 1
         batch_size = len(batch_refs)
+
         logger.info(
-            f"Processing batch #{batch_index} with {batch_size} message ref(s)."
+            "Processing Gmail batch #%d (%d message refs)",
+            batch_index,
+            batch_size,
         )
 
         grouped_messages: dict[str, list[str]] = {}
+
         processed_count = 0
         skipped_old = 0
         skipped_no_classification = 0
+        failed_fetch = 0
 
         for message_ref in batch_refs:
             message_id = message_ref["id"]
-            logger.debug(f"Fetching full message for ID: {message_id}")
+            logger.debug("Fetching Gmail message (id=%s)", message_id)
 
             try:
                 raw_message = (
@@ -301,70 +313,102 @@ def _generate_data_from_gmail_(config: ConfigParser, service: Resource, chunk_si
                     )
                     .execute()
                 )
-                logger.debug(f"Successfully fetched raw message for ID: {message_id}")
-            except Exception as e:
-                logger.error(
-                    f"Failed to fetch message ID {message_id}: {e}", exc_info=True
-                )
+            except Exception:
+                failed_fetch += 1
+                logger.exception("Failed to fetch message (id=%s)", message_id)
                 continue
+
+            logger.debug("Message fetched successfully (id=%s)", message_id)
 
             message = parse_message(raw_message)
             email_date = message.get("date")
-            logger.debug(f"Message ID {message_id} — parsed date: {email_date}")
+
+            logger.debug(
+                "Parsed message metadata (id=%s, date=%s)",
+                message_id,
+                email_date,
+            )
 
             if email_date and oldest_date and email_date < oldest_date:
-                logger.info(
-                    f"Message ID {message_id} dated {email_date} is older than cutoff "
-                    f"{oldest_date}. Stopping fetch."
-                )
                 skipped_old += 1
+
+                logger.info(
+                    "Cutoff reached. Message too old (id=%s, date=%s < cutoff=%s). "
+                    "Stopping batch early.",
+                    message_id,
+                    email_date,
+                    oldest_date,
+                )
+
                 continue_fetching = False
                 break
 
-            logger.debug(f"Classifying message ID: {message_id}")
+            logger.debug("Classifying message (id=%s)", message_id)
+
             classification = classify_email(
                 ranked_clients, text_cleaner, ranked_llms, message, logger
             )
+
             logger.debug(
-                f"Message ID {message_id} — classification result: '{classification}'"
+                "Classification result (id=%s): %r",
+                message_id,
+                classification,
             )
 
-            if classification in [NONE_CONTENT_FLAG, "None"]:
-                logger.debug(
-                    f"Message ID {message_id} skipped — no meaningful content classification."
-                )
+            if classification in [NONE_CONTENT_FLAG, "None", None]:
                 skipped_no_classification += 1
+                logger.debug(
+                    "Message skipped (id=%s): no meaningful classification",
+                    message_id,
+                )
                 continue
 
-            if classification:
-                category = classification.replace(" ", "/")
-                grouped_messages.setdefault(category, []).append(message_id)
-                logger.debug(
-                    f"Message ID {message_id} assigned to category: '{category}'"
-                )
-            else:
-                logger.warning(
-                    f"Message ID {message_id} returned a falsy classification: {classification!r}"
-                )
-                skipped_no_classification += 1
+            category = classification.replace(" ", "/")
+            grouped_messages.setdefault(category, []).append(message_id)
+
+            logger.debug(
+                "Assigned category (id=%s -> %s)",
+                message_id,
+                category,
+            )
 
             processed_count += 1
 
-        category_summary = {cat: len(ids) for cat, ids in grouped_messages.items()}
+            if update_chunk_size and processed_count % update_chunk_size == 0:
+                logger.info(
+                    "Yielding intermediate batch result (batch=%d, processed=%d)",
+                    batch_index,
+                    processed_count,
+                )
+                yield grouped_messages
+                grouped_messages = {}
+
+        category_summary = {k: len(v) for k, v in grouped_messages.items()}
+
         logger.info(
-            f"Batch #{batch_index} complete — processed: {processed_count}, "
-            f"skipped (too old): {skipped_old}, skipped (no classification): {skipped_no_classification}. "
-            f"Categories: {category_summary}"
+            "Completed Gmail batch #%d | processed=%d | fetched_failures=%d | "
+            "skipped_old=%d | skipped_no_classification=%d | categories=%s",
+            batch_index,
+            processed_count,
+            failed_fetch,
+            skipped_old,
+            skipped_no_classification,
+            category_summary,
         )
 
+        logger.debug("Yielding final batch result for batch #%d", batch_index)
         yield grouped_messages
 
         if not continue_fetching:
-            logger.info("Reached oldest_date cutoff — stopping batch iteration.")
+            logger.info(
+                "Stopping pipeline: oldest_date cutoff reached (batch=%d).",
+                batch_index,
+            )
             break
 
     logger.info(
-        f"Gmail data generation pipeline finished after {batch_index} batch(es)."
+        "Gmail data generation pipeline finished (total_batches=%d).",
+        batch_index,
     )
 
 
@@ -374,6 +418,7 @@ def generate_data(
     service: Optional[Resource] = None,
     live_mode: bool = False,
     chunk_size=64,
+    update_chunk_size: Optional[int] = None,
 ):
     if not live_mode:
         if not cur:
@@ -388,7 +433,7 @@ def generate_data(
     if not service:
         logger.error("Service argument missing for a live_mode data generation.")
         raise ValueError("Service argument missing for a live_mode data generation.")
-    return _generate_data_from_gmail_(config, service, chunk_size)
+    return _generate_data_from_gmail_(config, service, chunk_size, update_chunk_size)
 
 
 def main():
@@ -422,7 +467,9 @@ def main():
     total_messages = 0
     total_batches = 0
 
-    for batch in generate_data(config, read_cur, service, live_mode):
+    for batch in generate_data(
+        config, read_cur, service, live_mode, update_chunk_size=10
+    ):
         total_batches += 1
 
         if len(batch) == 0:
