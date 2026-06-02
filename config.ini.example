@@ -1,9 +1,9 @@
 [default]
 mode = development
+logs_path = logs
 
 [classifier]
 db_path = database.db
-logs_path = logs
 skip_classified = True
 
 [dev]

@@ -1,10 +1,7 @@
 import json
-import logging
-import random
 import re
 import sqlite3
 import sys
-import time
 import uuid
 from collections import OrderedDict
 from configparser import ConfigParser
@@ -31,18 +28,11 @@ from openai.types.chat import (
 )
 
 from classifier.text_cleaner import TextCleaner
+from utils.config import set_runtime_value
+from utils.log import add_file_handler, create_logger
+from utils.misc import sleep_stochastically
 
-formatter = logging.Formatter(
-    "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
-
-logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
-console_handler = logging.StreamHandler()
-console_handler.setFormatter(formatter)
-
-logger.addHandler(console_handler)
+logger = create_logger(None, __name__)
 
 MODE = Literal["dev", "prod"]
 DEFAULT_MODE: MODE = "prod"
@@ -452,12 +442,6 @@ def save_to_json(config: ConfigParser, temp_data: List[ClassifiedEmail]):
         raise
 
 
-def sleep_stochastically(min_s: float = 0.25, max_s: float = 3.0):
-    duration = random.uniform(min_s, max_s)
-    logger.info(f"Sleeping for {duration:.2f} seconds")
-    time.sleep(duration)
-
-
 def create_clients(llms: List[LLMConfig]) -> OrderedDict[str, OpenAI]:
     logger.info("Initialising OpenAI clients")
     clients: OrderedDict[str, OpenAI] = OrderedDict()
@@ -486,14 +470,8 @@ def main():
     text_cleaner = TextCleaner(logger)
 
     run_id = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    log_path = Path(config["classifier"].get("logs_path", "logs")) / run_id
-    log_path.mkdir(parents=True, exist_ok=True)
-    logger.info(f"Current run logs can be found at: {log_path}")
-
-    file_handler = logging.FileHandler(log_path / "classifier.log")
-    file_handler.setFormatter(formatter)
-
-    logger.addHandler(file_handler)
+    set_runtime_value(config, "run_id", run_id)
+    add_file_handler(config, logger, "classifier.log")
 
     con = create_connection(config)
     read_cursor = con.cursor()
