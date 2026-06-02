@@ -114,3 +114,4 @@ logs/
 sample.*.txt
 
 credentials.json
+token.json
