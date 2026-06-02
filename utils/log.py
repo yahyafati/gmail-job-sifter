@@ -4,8 +4,6 @@ from configparser import ConfigParser
 from logging import Logger
 from typing import Optional
 
-from utils.config import get_runtime_value
-
 __formatter = logging.Formatter(
     "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
@@ -39,6 +37,8 @@ def create_logger(
 
 
 def add_file_handler(config: ConfigParser, logger: Logger, file_name: str):
+    from utils.config import get_runtime_value
+
     log_path = pathlib.Path(config.get("default", "logs_path"))
     log_path = log_path / get_runtime_value(config, "run_id")
     log_path.mkdir(parents=True, exist_ok=True)

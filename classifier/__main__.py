@@ -2,21 +2,13 @@ import json
 import re
 import sqlite3
 import sys
-import uuid
 from collections import OrderedDict
 from configparser import ConfigParser
 from datetime import datetime
-from functools import wraps
 from pathlib import Path
 from typing import (
-    Protocol,
-    runtime_checkable,
     List,
     Iterator,
-    TypedDict,
-    Literal,
-    cast,
-    Union,
     Tuple,
     Optional,
 )
@@ -27,112 +19,17 @@ from openai.types.chat import (
     ChatCompletionSystemMessageParam,
 )
 
+from classifier.prompts import system_prompt, user_prompt
 from classifier.text_cleaner import TextCleaner
-from utils.config import set_runtime_value
+from classifier.types import LLMConfig, EmailObject, ClassifiedEmail
+from utils.config import set_runtime_value, init_mode, load_config
+from utils.db import create_connection, close_connections
 from utils.log import add_file_handler, create_logger
-from utils.misc import sleep_stochastically
+from utils.misc import sleep_stochastically, get_override_safe_path
 
 logger = create_logger(None, __name__)
 
-MODE = Literal["dev", "prod"]
-DEFAULT_MODE: MODE = "prod"
-mode: MODE = DEFAULT_MODE
-
 NONE_CONTENT_FLAG = "CONTENT_WAS_NONE"
-
-
-@runtime_checkable
-class Closeable(Protocol):
-    def close(self) -> None: ...
-
-
-class EmailObject(TypedDict):
-    message_id: str
-    subject: str
-    body: str
-    sender: str
-
-
-class ClassifiedEmail(TypedDict):
-    message_id: str
-    subject: str
-    body: str
-    sender: str
-    classification: str
-
-
-class ExceptionEmails(TypedDict):
-    message_id: str
-    exception: str
-    message: str
-    body: object
-
-
-class LLMConfig(TypedDict):
-    name: str
-    api_key: str
-    base_url: str
-    model: str
-
-
-CLOSEABLE: List[Closeable] = []
-
-
-def load_config(config_path="config.ini") -> ConfigParser:
-    logger.debug("Loading configuration from '%s'", config_path)
-    config = ConfigParser()
-    files_read = config.read(config_path)
-    if not files_read:
-        logger.warning(
-            "Config file '%s' not found or empty; using defaults", config_path
-        )
-    else:
-        logger.info("Configuration loaded from: %s", files_read)
-        logger.debug(
-            "Config sections found: %s",
-            config.sections(),
-        )
-    return config
-
-
-def set_mode(config: ConfigParser) -> MODE:
-    global mode
-    logger.debug("Reading 'mode' from config [default] section")
-    _mode = config["default"].get("mode", mode)
-    mode = cast(MODE, _mode)
-    if not _mode:
-        logger.warning(
-            "No 'mode' key found in config; falling back to DEFAULT_MODE='%s'",
-            DEFAULT_MODE,
-        )
-        return DEFAULT_MODE
-    logger.info("Application mode set to '%s'", mode)
-    return mode
-
-
-def run_on_mode(mode_required):
-    def decorator(func):
-        @wraps(func)
-        def wrapper(*args, **kwargs):
-            current_mode = globals().get("mode")
-            if current_mode != mode_required:
-                logger.debug(
-                    "Skipping '%s': requires mode='%s', current mode='%s'",
-                    func.__name__,
-                    mode_required,
-                    current_mode,
-                )
-                return None
-            logger.debug(
-                "Running '%s' (mode='%s' matches requirement)",
-                func.__name__,
-                mode_required,
-            )
-            return func(*args, **kwargs)
-
-        return wrapper
-
-    return decorator
 
 
 def get_ranked_llms(config: ConfigParser) -> List[LLMConfig]:
@@ -158,101 +55,6 @@ def get_ranked_llms(config: ConfigParser) -> List[LLMConfig]:
     llms.sort(key=lambda x: x[0])
 
     return [llm for _, llm in llms]
-
-
-def system_prompt() -> str:
-    return """
-You are an email classification system.
-
-Classify the given email into exactly one of the following categories:
-
-* `Job Application`
-* `Job Rejection`
-* `Job Interview`
-* `Job Advertisement`
-* `None`
-
-Definitions:
-
-* Job Application: Confirmation or submission of an application.
-* Job Rejection: Explicit decline or unsuccessful outcome.
-* Job Interview: Invitation, scheduling, or discussion of an interview.
-* Job Advertisement: Job offers, recruiting emails, or open positions.
-* None: Not related to jobs.
-
-Rules:
-
-* Output only the category name.
-* Do not explain your answer.
-* If uncertain, choose the closest match.
-    """.strip("\n")
-
-
-def user_prompt(email: EmailObject) -> str:
-    return f"""
-From: {email['sender']}
-Subject: {email['subject']}
-
-{email['body']}
-"""
-
-
-def create_connection(config: ConfigParser) -> sqlite3.Connection:
-    global CLOSEABLE
-    db_path = config["classifier"]["db_path"]
-    logger.info("Connecting to SQLite database at '%s'", db_path)
-    try:
-        con = sqlite3.connect(db_path)
-        CLOSEABLE.append(con)
-        logger.debug("Database connection established and registered for cleanup")
-    except sqlite3.Error as e:
-        logger.exception("Failed to connect to database at '%s': %s", db_path, e)
-        raise
-    return con
-
-
-def get_override_safe_path(
-    path: Union[Path, str], max_iter=100, uuid_on_max_iter=True
-) -> Path:
-    path = Path(path)
-    logger.debug("Resolving collision-safe path for '%s'", path)
-    suffix_count = 0
-
-    original_stem = path.stem
-    original_suffix = path.suffix
-    parent = path.parent
-
-    while path.exists():
-        suffix_count += 1
-        path = parent / f"{original_stem}_{suffix_count}{original_suffix}"
-        logger.debug("Path already exists; trying '%s'", path)
-
-        if suffix_count >= max_iter:
-            break
-
-    if path.exists():
-        if uuid_on_max_iter:
-            new_path = parent / f"{original_stem}_{uuid.uuid4()}{original_suffix}"
-            logger.warning(
-                "Reached max_iter=%d collision attempts for '%s'; "
-                "falling back to UUID path '%s'",
-                max_iter,
-                original_stem,
-                new_path,
-            )
-            path = new_path
-        else:
-            logger.error(
-                "Could not find a free path after %d attempts for '%s'",
-                max_iter,
-                original_stem,
-            )
-            raise FileExistsError(
-                f"Could not find free path after {max_iter} attempts: {path}"
-            )
-
-    logger.debug("Resolved safe output path: '%s'", path)
-    return path
 
 
 def get_row_count(config: ConfigParser, cur: sqlite3.Cursor) -> int:
@@ -465,7 +267,8 @@ def main():
     logger.info("=== Email Classifier Starting ===")
 
     config = load_config()
-    set_mode(config)
+
+    current_mode = init_mode(config)
 
     text_cleaner = TextCleaner(logger)
 
@@ -473,9 +276,7 @@ def main():
     set_runtime_value(config, "run_id", run_id)
     add_file_handler(config, logger, "classifier.log")
 
-    con = create_connection(config)
-    read_cursor = con.cursor()
-    write_cursor = con.cursor()
+    con, read_cursor, write_cursor = create_connection(config)
     logger.debug("Database cursor created")
 
     ranked_llms = get_ranked_llms(config)
@@ -549,7 +350,6 @@ def main():
     if none_content_count:
         logger.warning("  Emails with None LLM response: %d", none_content_count)
 
-    current_mode = globals().get("mode", "prod")
     logger.debug("Post-classification mode check: mode='%s'", current_mode)
     if current_mode == "dev":
         logger.info("Dev mode active — saving results to JSON")
@@ -570,11 +370,6 @@ if __name__ == "__main__":
         logger.exception("Unhandled exception in main(); aborting")
         raise
     finally:
-        logger.debug("Running cleanup for %d closeable resource(s)", len(CLOSEABLE))
-        for item in CLOSEABLE:
-            try:
-                item.close()
-                logger.debug("Closed resource: %s", item)
-            except Exception as e:
-                logger.warning("Failed to close resource %s: %s", item, e)
+        logger.debug("Running cleanup for any closeable resource(s)")
+        close_connections()
         logger.info("Cleanup complete")
