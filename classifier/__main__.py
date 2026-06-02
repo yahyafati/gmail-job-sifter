@@ -209,7 +209,7 @@ Subject: {email['subject']}
 
 def create_connection(config: ConfigParser) -> sqlite3.Connection:
     global CLOSEABLE
-    db_path = config["default"]["db_path"]
+    db_path = config["classifier"]["db_path"]
     logger.info("Connecting to SQLite database at '%s'", db_path)
     try:
         con = sqlite3.connect(db_path)
@@ -267,7 +267,7 @@ def get_override_safe_path(
 
 def get_row_count(config: ConfigParser, cur: sqlite3.Cursor) -> int:
     logger.debug("Querying total email row count")
-    skip_classified = config["default"]["skip_classified"].lower() in [
+    skip_classified = config["classifier"]["skip_classified"].lower() in [
         "true",
         "on",
         "1",
@@ -292,7 +292,7 @@ def generate_dataset(
     cur: sqlite3.Cursor,
     chunk_size=64,
 ) -> Iterator[EmailObject]:
-    skip_classified = config["default"]["skip_classified"].lower() in [
+    skip_classified = config["classifier"]["skip_classified"].lower() in [
         "true",
         "on",
         "1",
@@ -486,11 +486,11 @@ def main():
     text_cleaner = TextCleaner(logger)
 
     run_id = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    log_path = Path(config["default"].get("logs_path", "logs")) / run_id
+    log_path = Path(config["classifier"].get("logs_path", "logs")) / run_id
     log_path.mkdir(parents=True, exist_ok=True)
     logger.info(f"Current run logs can be found at: {log_path}")
 
-    file_handler = logging.FileHandler(log_path / "app.log")
+    file_handler = logging.FileHandler(log_path / "classifier.log")
     file_handler.setFormatter(formatter)
 
     logger.addHandler(file_handler)

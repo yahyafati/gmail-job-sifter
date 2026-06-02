@@ -112,3 +112,5 @@ config.ini
 samples/
 logs/
 sample.*.txt
+
+credentials.json
