@@ -30,7 +30,7 @@ from openai.types.chat import (
     ChatCompletionSystemMessageParam,
 )
 
-from text_cleaner import TextCleaner
+from classifier.text_cleaner import TextCleaner
 
 formatter = logging.Formatter(
     "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
