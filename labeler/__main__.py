@@ -425,6 +425,10 @@ def main():
     for batch in generate_data(config, read_cur, service, live_mode):
         total_batches += 1
 
+        if len(batch) == 0:
+            logger.info("No more data in batch!")
+            break
+
         for label, ids in batch.items():
             label_id = label_tree[label]["id"]
 
