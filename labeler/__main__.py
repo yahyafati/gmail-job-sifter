@@ -1,14 +1,23 @@
 import os.path
 import sqlite3
+import sys
 from configparser import ConfigParser
 from datetime import datetime
-from typing import Optional, TypedDict
+from typing import Optional, TypedDict, Iterable, List, Dict
 
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build, Resource
 
+from classifier.text_cleaner import TextCleaner
+from classifier.utils import (
+    classify_email,
+    get_ranked_llms,
+    create_clients,
+    NONE_CONTENT_FLAG,
+)
+from labeler.parser import parse_message, normalize_email_date
 from utils.config import load_config, set_runtime_value
 from utils.db import create_connection, close_connections
 from utils.log import create_logger, add_file_handler
@@ -164,12 +173,12 @@ def ensure_labels(creds: Credentials) -> dict[str, LabelNode]:
     return flat
 
 
-def generate_data(cur: sqlite3.Cursor, chunk_size=64):
+def _generate_data_from_db_(cur: sqlite3.Cursor, chunk_size=64):
     query = """
-    SELECT message_id, category
-    FROM emails
-    WHERE category IS NOT NULL AND category != 'None'
-    """
+            SELECT message_id, category
+            FROM emails
+            WHERE category IS NOT NULL AND category != 'None' \
+            """
 
     logger.info("Executing query for labeled emails")
 
@@ -205,6 +214,115 @@ def generate_data(cur: sqlite3.Cursor, chunk_size=64):
         yield grouped_messages
 
 
+def list_message_refs(
+    service: Resource, chunk_size: int, user_id: str = "me"
+) -> Iterable[List[Dict[str, str]]]:
+    page_token = None
+    page_number = 0
+    logger.info(
+        "Starting to list messages for user: %s with batch size: %s",
+        user_id,
+        chunk_size,
+    )
+
+    while True:
+        page_number += 1
+        response = (
+            service.users()
+            .messages()
+            .list(
+                userId=user_id,
+                maxResults=chunk_size,
+                pageToken=page_token,
+            )
+            .execute()
+        )
+        messages = response.get("messages", [])
+        if messages:
+            logger.info(
+                "Fetched Gmail message reference page %s with %s messages",
+                page_number,
+                len(messages),
+            )
+            yield messages
+
+        page_token = response.get("nextPageToken")
+        if not page_token:
+            logger.info("Reached end of Gmail message list after %s pages", page_number)
+            break
+
+
+def _generate_data_from_gmail_(config: ConfigParser, service: Resource, chunk_size=64):
+    ranked_llms = get_ranked_llms(config)
+    if len(ranked_llms) == 0:
+        logger.fatal("At least one LLM definition needed.")
+        sys.exit(32)
+    ranked_clients = create_clients(ranked_llms, logger)
+    logger.debug(f"{len(ranked_clients)} OpenAI clients initialized.")
+    text_cleaner = TextCleaner(logger)
+
+    oldest_date = normalize_email_date(config.get("labeler", "after_date"))
+    continue_fetching = True
+    for batch_refs in list_message_refs(service=service, chunk_size=chunk_size):
+        grouped_messages: dict[str, list[str]] = {}
+        for message_ref in batch_refs:
+            message_id = message_ref["id"]
+
+            raw_message = (
+                service.users()
+                .messages()
+                .get(
+                    userId="me",
+                    id=message_id,
+                    format="full",
+                )
+                .execute()
+            )
+            message = parse_message(raw_message)
+            email_date = message["date"]
+            if email_date and oldest_date and email_date < oldest_date:
+                continue_fetching = False
+                break
+            classification = classify_email(
+                ranked_clients, text_cleaner, ranked_llms, message, logger
+            )
+
+            if classification in [NONE_CONTENT_FLAG, "None"]:
+                continue
+
+            if classification:
+                category = classification.replace(" ", "/")
+
+                grouped_messages.setdefault(category, []).append(message_id)
+        yield grouped_messages
+
+        if not continue_fetching:
+            break
+
+
+def generate_data(
+    config: ConfigParser,
+    cur: Optional[sqlite3.Cursor],
+    service: Optional[Resource] = None,
+    live_mode: bool = False,
+    chunk_size=64,
+):
+    if not live_mode:
+        if not cur:
+            logger.error(
+                "Database Cursor argument missing for a offline mode data generation."
+            )
+            raise ValueError(
+                "Database Cursor argument missing for a offline mode data generation."
+            )
+        return _generate_data_from_db_(cur, chunk_size)
+
+    if not service:
+        logger.error("Service argument missing for a live_mode data generation.")
+        raise ValueError("Service argument missing for a live_mode data generation.")
+    return _generate_data_from_gmail_(config, service, chunk_size)
+
+
 def main():
     logger.info("=== Gmail Labeler Started ===")
 
@@ -223,13 +341,20 @@ def main():
 
     label_tree = ensure_labels(creds)
 
+    live_mode = config.get("labeler", "live_mode").lower().strip() in [
+        "true",
+        "on",
+        "1",
+    ]
+    logger.info(f"Live Mode: {'on' if live_mode else 'off'}")
+
     service = build("gmail", "v1", credentials=creds)
     logger.info("Gmail service initialized")
 
     total_messages = 0
     total_batches = 0
 
-    for batch in generate_data(read_cur):
+    for batch in generate_data(config, read_cur, service, live_mode):
         total_batches += 1
 
         for label, ids in batch.items():

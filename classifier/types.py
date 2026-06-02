@@ -1,6 +1,5 @@
-from typing import Protocol, TypedDict
-
-from typing_extensions import runtime_checkable
+from datetime import datetime
+from typing import Protocol, TypedDict, Optional, runtime_checkable
 
 
 @runtime_checkable
@@ -13,6 +12,14 @@ class EmailObject(TypedDict):
     subject: str
     body: str
     sender: str
+
+
+class FetchedEmailObject(TypedDict):
+    message_id: str
+    subject: str
+    body: str
+    sender: str
+    date: Optional[datetime]
 
 
 class ClassifiedEmail(TypedDict):
