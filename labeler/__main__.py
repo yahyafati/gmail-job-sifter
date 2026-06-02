@@ -463,7 +463,14 @@ def main():
 
 if __name__ == "__main__":
     try:
+        logger.debug("Labeler Entry point reached")
         main()
+    except KeyboardInterrupt:
+        logger.fatal("User interrupted; aborting.")
+    except Exception:
+        logger.exception("Unhandled exception in main(); aborting")
+        raise
     finally:
-        logger.info("Shutting down, closing DB connections")
+        logger.debug("Running cleanup for any closeable resource(s)")
         close_connections()
+        logger.info("Cleanup complete")

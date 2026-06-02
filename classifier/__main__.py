@@ -122,7 +122,7 @@ def main():
 
 if __name__ == "__main__":
     try:
-        logger.debug("Entry point reached")
+        logger.debug("Classifier Entry point reached")
         main()
     except KeyboardInterrupt:
         logger.fatal("User interrupted; aborting.")
