@@ -253,51 +253,119 @@ def list_message_refs(
 
 
 def _generate_data_from_gmail_(config: ConfigParser, service: Resource, chunk_size=64):
+    logger.info("Starting Gmail data generation pipeline.")
+
     ranked_llms = get_ranked_llms(config)
+    logger.debug(f"Ranked LLMs retrieved: {ranked_llms}")
     if len(ranked_llms) == 0:
         logger.fatal("At least one LLM definition needed.")
         sys.exit(32)
+    logger.info(f"{len(ranked_llms)} ranked LLM(s) loaded.")
+
     ranked_clients = create_clients(ranked_llms, logger)
     logger.debug(f"{len(ranked_clients)} OpenAI clients initialized.")
+
     text_cleaner = TextCleaner(logger)
+    logger.debug("TextCleaner initialized.")
 
     oldest_date = normalize_email_date(config.get("labeler", "after_date"))
+    logger.info(f"Oldest allowed email date (after_date): {oldest_date}")
+
     continue_fetching = True
+    batch_index = 0
+
     for batch_refs in list_message_refs(service=service, chunk_size=chunk_size):
+        batch_index += 1
+        batch_size = len(batch_refs)
+        logger.info(
+            f"Processing batch #{batch_index} with {batch_size} message ref(s)."
+        )
+
         grouped_messages: dict[str, list[str]] = {}
+        processed_count = 0
+        skipped_old = 0
+        skipped_no_classification = 0
+
         for message_ref in batch_refs:
             message_id = message_ref["id"]
+            logger.debug(f"Fetching full message for ID: {message_id}")
 
-            raw_message = (
-                service.users()
-                .messages()
-                .get(
-                    userId="me",
-                    id=message_id,
-                    format="full",
+            try:
+                raw_message = (
+                    service.users()
+                    .messages()
+                    .get(
+                        userId="me",
+                        id=message_id,
+                        format="full",
+                    )
+                    .execute()
                 )
-                .execute()
-            )
+                logger.debug(f"Successfully fetched raw message for ID: {message_id}")
+            except Exception as e:
+                logger.error(
+                    f"Failed to fetch message ID {message_id}: {e}", exc_info=True
+                )
+                continue
+
             message = parse_message(raw_message)
-            email_date = message["date"]
+            email_date = message.get("date")
+            logger.debug(f"Message ID {message_id} — parsed date: {email_date}")
+
             if email_date and oldest_date and email_date < oldest_date:
+                logger.info(
+                    f"Message ID {message_id} dated {email_date} is older than cutoff "
+                    f"{oldest_date}. Stopping fetch."
+                )
+                skipped_old += 1
                 continue_fetching = False
                 break
+
+            logger.debug(f"Classifying message ID: {message_id}")
             classification = classify_email(
                 ranked_clients, text_cleaner, ranked_llms, message, logger
             )
+            logger.debug(
+                f"Message ID {message_id} — classification result: '{classification}'"
+            )
 
             if classification in [NONE_CONTENT_FLAG, "None"]:
+                logger.debug(
+                    f"Message ID {message_id} skipped — no meaningful content classification."
+                )
+                skipped_no_classification += 1
                 continue
 
             if classification:
                 category = classification.replace(" ", "/")
-
                 grouped_messages.setdefault(category, []).append(message_id)
+                logger.debug(
+                    f"Message ID {message_id} assigned to category: '{category}'"
+                )
+            else:
+                logger.warning(
+                    f"Message ID {message_id} returned a falsy classification: {classification!r}"
+                )
+                skipped_no_classification += 1
+
+            processed_count += 1
+
+        category_summary = {cat: len(ids) for cat, ids in grouped_messages.items()}
+        logger.info(
+            f"Batch #{batch_index} complete — processed: {processed_count}, "
+            f"skipped (too old): {skipped_old}, skipped (no classification): {skipped_no_classification}. "
+            f"Categories: {category_summary}"
+        )
+
         yield grouped_messages
 
         if not continue_fetching:
+            logger.info("Reached oldest_date cutoff — stopping batch iteration.")
             break
+
+    logger.info(
+        f"Gmail data generation pipeline finished after {batch_index} batch(es)."
+    )
 
 
 def generate_data(
