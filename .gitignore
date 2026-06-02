@@ -115,3 +115,5 @@ sample.*.txt
 
 credentials.json
 token.json
+*.db
+*.db*
