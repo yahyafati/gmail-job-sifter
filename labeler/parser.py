@@ -41,15 +41,19 @@ def normalize_email_date(date_value: Optional[str]) -> Optional[datetime]:
         return None
 
     try:
-        parsed = parsedate_to_datetime(date_value)
+        dt = datetime.fromisoformat(date_value)
+    except ValueError:
+        # try:
+        dt = parsedate_to_datetime(date_value)
+    # except (TypeError, ValueError, IndexError) as e:
+    #     return None
 
-        if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=timezone.utc)
+    # Ensure timezone awareness
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
 
-        return parsed.astimezone(timezone.utc)
-
-    except (TypeError, ValueError, IndexError):
-        return None
+    # Normalize to UTC
+    return dt.astimezone(timezone.utc)
 
 
 def parse_message(raw_message: Dict[str, Any]) -> FetchedEmailObject:
