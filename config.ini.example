@@ -6,6 +6,13 @@ logs_path = logs
 db_path = database.db
 skip_classified = True
 
+[labeler]
+db_path = database.db
+credentials_path = credentials.json
+token_path = token.json
+live_mode = on
+after_date = 2026-03-30T23:33:41+00:00
+
 [dev]
 output_path = dev/samples
 
